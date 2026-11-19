@@ -491,12 +491,12 @@ class HidTempReader:
             self.ok = False
 
     def read(self):
-        """Returns (cpu_temp, gpu_temp, core_temps_dict)."""
+        """Returns (cpu_temp, gpu_temp, soc_temp); soc_temp is the PMU fallback."""
         if not self.ok:
-            return None, None, {}
+            return None, None, None
         client = IOKIT.IOHIDEventSystemClientCreate(None)
         if not client:
-            return None, None, {}
+            return None, None, None
         k_page = cf_str("PrimaryUsagePage")
         k_usage = cf_str("PrimaryUsage")
         k_prod = cf_str("Product")
@@ -537,7 +537,9 @@ class HidTempReader:
                     if not (10.0 < t < 130.0):
                         continue
                     ln = name.lower()
-                    if any(x in ln for x in ("pacc", "eacc", "tdie", "cpu")):
+                    # pACC/eACC MTR sensors (MacBooks) track the cores. "PMU tdie"/"tdev" are the
+                    # power-management chip's own die and sit near ambient, so they're a last resort.
+                    if any(x in ln for x in ("pacc", "eacc", "cpu")):
                         cpu_temps.append(t)
                     elif "gpu" in ln:
                         gpu_temps.append(t)
@@ -548,11 +550,10 @@ class HidTempReader:
                 if ref:
                     CF.CFRelease(ref)
 
-        cpu_t = (sum(cpu_temps) / len(cpu_temps)) if cpu_temps else (
-            (sum(soc_temps) / len(soc_temps)) if soc_temps else None
-        )
+        cpu_t = (sum(cpu_temps) / len(cpu_temps)) if cpu_temps else None
+        soc_t = (sum(soc_temps) / len(soc_temps)) if soc_temps else None
         gpu_t = (sum(gpu_temps) / len(gpu_temps)) if gpu_temps else None
-        return cpu_t, gpu_t, {}
+        return cpu_t, gpu_t, soc_t
 
 
 # ── AppleSMC Reader (Intel temperatures + Fan speeds on Intel & Apple Silicon) ─
@@ -604,11 +605,22 @@ class SmcReader:
 
     KERNEL_INDEX_SMC = 2
     SMC_CMD_READ_BYTES = 5
+    SMC_CMD_READ_INDEX = 8
     SMC_CMD_READ_KEYINFO = 9
+
+    # Per-core die sensors by logical CPU (E cores first, as in the device tree), for chips
+    # where the mapping is known: (E cores, P cores) -> keys. M1 Pro/Max 10-core, same keys
+    # as the Stats app; checked on an M1 Max (the two E sensors heat least under full load).
+    CORE_TEMP_KEYS = {
+        ("M1", 2, 8): ("Tp09", "Tp0T", "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b"),
+    }
 
     def __init__(self):
         self.conn = c_uint32(0)
         self.key_info_cache = {}
+        self.apple_silicon = False
+        self.core_keys = None    # per-core die sensors, when this chip's map is known
+        self.die_keys = []       # every core die sensor, for the CPU average otherwise
         if IOKIT is None or LIBC is None:
             return
         try:
@@ -687,7 +699,48 @@ class SmcReader:
             return raw[0]
         if t_str == "ui16" and d_size == 2:
             return struct.unpack(">H", raw)[0]
+        if t_str == "ui32" and d_size == 4:
+            return struct.unpack(">I", raw)[0]
         return None
+
+    def list_keys(self):
+        """Every SMC key name (the SMC has ~1-2k; reading them all takes a few ms)."""
+        if not self.conn.value:
+            return []
+        total = self.read_key("#KEY")
+        keys = []
+        for i in range(int(total or 0)):
+            inp, outp = SMCKeyData(), SMCKeyData()
+            inp.data8 = self.SMC_CMD_READ_INDEX
+            inp.data32 = i
+            if self._call(inp, outp) == 0 and outp.key:
+                keys.append(struct.pack(">I", outp.key).decode("ascii", "replace"))
+        return keys
+
+    def setup_core_temps(self, chip, e_cores, p_cores):
+        """Apple Silicon: picks the per-core map for this chip if known, plus every core die
+        sensor (Tp??/Te??/Tf??) for the CPU average on chips without a map."""
+        self.apple_silicon = True
+        m = re.search(r"\bM\d+\b", chip or "")   # "Apple M1 Max" -> "M1"
+        family = m.group(0) if m else ""
+        self.core_keys = self.CORE_TEMP_KEYS.get((family, e_cores, p_cores))
+        if self.core_keys and any(self.read_key(k) is None for k in self.core_keys):
+            self.core_keys = None
+        self.die_keys = [k for k in self.list_keys() if re.match(r"^T[pef][0-9A-Za-z]{2}$", k)]
+
+    def read_core_temps(self):
+        """Returns (cpu_avg, {logical_cpu: temp})."""
+        if self.core_keys:
+            per = {}
+            for i, k in enumerate(self.core_keys):
+                v = self.read_key(k)
+                if v is not None and 10.0 < v < 130.0:
+                    per[i] = v
+            if per:
+                return sum(per.values()) / len(per), per
+        vals = [v for v in (self.read_key(k) for k in self.die_keys)
+                if v is not None and 10.0 < v < 130.0]
+        return (sum(vals) / len(vals) if vals else None), {}
 
     def read_fan_pct(self):
         if not self.conn.value:
@@ -719,12 +772,21 @@ class SmcReader:
                 cpu_t = v
                 break
         gpu_t = None
-        for k in ("TG0P", "TG0D", "Tg05", "Tg0D"):
+        for k in ("TG0P", "TG0D"):   # Intel
             v = self.read_key(k)
             if v and 10.0 < v < 130.0:
                 gpu_t = v
                 break
-        cpu_w = self.read_key("PCPC") or self.read_key("PC0C")
+        if gpu_t is None:   # Apple Silicon GPU cluster sensors (read ~0 while the GPU is power-gated)
+            vals = [v for v in (self.read_key(k) for k in ("Tg05", "Tg0D", "Tg0L", "Tg0T"))
+                    if v and 10.0 < v < 130.0]
+            gpu_t = sum(vals) / len(vals) if vals else None
+        cpu_w = self.read_key("PCPC") or self.read_key("PC0C")   # Intel package / core
+        if cpu_w is None and self.apple_silicon:
+            # CPU rail power. Checked against `sudo powermetrics` on an M1 Max: within ~1 W from
+            # idle to all-core load (it includes the ~1 W static draw powermetrics leaves out).
+            # Used when IOReport's CPU Energy counter is frozen, as on macOS 27.
+            cpu_w = self.read_key("PSVC")
         gpu_w = self.read_key("PCPG") or self.read_key("PG0R")
         if cpu_w is not None and not (0.0 <= cpu_w < 500.0):
             cpu_w = None
@@ -989,6 +1051,10 @@ class MacSensors:
     def __init__(self):
         self.hid = HidTempReader()
         self.smc = SmcReader()
+        self.good = {}   # sensor -> (last good value, when)
+        _, p_cores, e_cores = get_core_topology()
+        if p_cores:   # Apple Silicon
+            self.smc.setup_core_temps(get_cpu_name(), e_cores or 0, p_cores)
         self.ioreport = IOReportSampler()
         freq_hz = sysctl_int("hw.cpufrequency") or sysctl_int("hw.cpufrequency_max")
         self.sysctl_mhz = (freq_hz / 1e6) if freq_hz else None
@@ -1003,18 +1069,35 @@ class MacSensors:
         self.ioreport.close()
 
     def sample(self):
-        cpu_t, gpu_t, core_t = self.hid.read()
+        cpu_t, gpu_t, soc_t = self.hid.read()
+        core_t = {}
+        if cpu_t is None:
+            cpu_t, core_t = self.smc.read_core_temps()
+        if cpu_t is None:
+            cpu_t = soc_t
         smc_cpu_t, smc_gpu_t, smc_cpu_w, smc_gpu_w = self.smc.read_temps_and_power()
         fan_pct = self.smc.read_fan_pct()
         ior = self.ioreport.sample()
 
+        # Sensors drop out for a sample now and then (power-gated GPU): hold the last good
+        # reading for a few seconds rather than flicking the field off and on.
+        now = time.monotonic()
+        held = {}
+        for name, val in (("cpu", cpu_t if cpu_t is not None else smc_cpu_t),
+                          ("gpu", gpu_t if gpu_t is not None else smc_gpu_t)):
+            if val is not None:
+                self.good[name] = (val, now)
+            elif name in self.good and now - self.good[name][1] < 10.0:
+                val = self.good[name][0]
+            held[name] = val
+
         self.last = {
-            "Temp": cpu_t if cpu_t is not None else smc_cpu_t,
+            "Temp": held["cpu"],
             "Tag": "",
             "PowerW": ior["CpuPowerW"] if ior["CpuPowerW"] is not None else smc_cpu_w,
             "ClockMHz": ior["CpuClockMHz"] if ior["CpuClockMHz"] is not None else self.sysctl_mhz,
             "CoreTemps": core_t,
-            "GpuTemp": gpu_t if gpu_t is not None else smc_gpu_t,
+            "GpuTemp": held["gpu"],
             "GpuPowerW": ior["GpuPowerW"] if ior["GpuPowerW"] is not None else smc_gpu_w,
             "GpuClockMHz": ior["GpuClockMHz"],
             "FanPct": fan_pct,
@@ -1639,13 +1722,36 @@ class ProcSampler:
         return sorted({int(arr[i]) for i in range(n) if arr[i] > 0})
 
     @staticmethod
-    def _proc_name(pid, bsd):
+    def _argv0(pid):
+        """The name a process was launched as (argv[0]), via sysctl KERN_PROCARGS2."""
+        mib = (c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+        size = c_size_t(0)
+        if LIBC.sysctl(mib, 3, None, byref(size), None, 0) != 0 or size.value < 8:
+            return None
+        buf = create_string_buffer(size.value)
+        if LIBC.sysctl(mib, 3, buf, byref(size), None, 0) != 0:
+            return None
+        # int argc, the exec path, NUL padding, then argv[0]
+        raw = buf.raw[4:size.value]
+        end = raw.find(b"\0")
+        if end < 0:
+            return None
+        rest = raw[end:].lstrip(b"\0")
+        argv0 = rest.split(b"\0", 1)[0].decode("utf-8", "replace")
+        return os.path.basename(argv0) or None
+
+    @classmethod
+    def _proc_name(cls, pid, bsd):
         if LIBC is not None:
             pbuf = create_string_buffer(1024)
             plen = LIBC.proc_pidpath(pid, pbuf, 1024)
             if plen > 0:
                 path = pbuf.value.decode("utf-8", "replace")
                 base = os.path.basename(path)
+                if base and not re.search(r"[A-Za-z]", base):
+                    # Versioned binaries (e.g. ~/.local/share/claude/versions/2.1.328) are named by
+                    # version; argv[0] ("claude") is what you'd recognise.
+                    base = cls._argv0(pid) or base
                 if base:
                     return base
         name = bsd.pbi_name.decode("utf-8", "replace").strip()
