@@ -1,4 +1,4 @@
-# atop — Apple Top for macOS
+# mactop
 NOTE: This is the macOS sibling of [ptop](https://github.com/stavrostzagadouris/powershellTop) (Windows) and [shtop](https://github.com/stavrostzagadouris/shelltop) (Linux). Feel free to use it if you want.
 
 > 🪟 **On Windows?** Check out **[ptop](https://github.com/stavrostzagadouris/powershellTop)**, the original Windows version.
@@ -33,7 +33,7 @@ It has the same layout, themes and keys as `ptop` and `shtop`. Under the hood it
 ## 🖥️ Interface Layout
 
 ```
- atop │ macbook-pro │ Up: 4d 11h 20m │ Bat: 88% (3h 45m left) │ 1000ms   [P]Cores [T]heme [C/M/G/I]Sort [↑↓/K]Kill [Q]uit │ 15:30:00
+ mactop │ macbook-pro │ Up: 4d 11h 20m │ Bat: 88% (3h 45m left) │ 1000ms   [P]Cores [T]heme [C/M/G/I]Sort [↑↓/K]Kill [Q]uit │ 15:30:00
 ╭─ CPU (Apple M3 Max) ────────────────────────────────╮╭─ GPU (Apple M3 Max · 40-Core) ──────────────────────╮
 │ CPU Total  ████████░░░░░░░░░░░░░░░░░░░░░  26.4%     ││ GPU Core   ██████████████░░░░░░░░░░░  61.0%         │
 │ History    ▁▂▃▄▃▂▁▂▃▅▆▄▃▂▁▂▃▄▃▂▁▂▃▄▅▄▃▂▁▂▃▄▃▂▁▂▃    ││ History    ▁▁▂▄▆▇▆▅▄▅▆▇█▇▆▅▄▅▆▆▅▄▃▄▅▆▅▄▅▆▅▄▃▄▅▆    │
@@ -57,20 +57,20 @@ It has the same layout, themes and keys as `ptop` and `shtop`. Under the hood it
 ```bash
 git clone https://github.com/stavrostzagadouris/mactop.git
 cd mactop
-./atop
+./mactop
 ```
 
-### Install the `atop` / `appletop` alias (optional)
-Run the included installer to add `atop` and `appletop` aliases to your shell config (`~/.zshrc`, `~/.bashrc` or fish `config.fish`, picked from `$SHELL`):
+### Install the `mactop` alias (optional)
+Run the included installer to add a `mactop` alias to your shell config (`~/.zshrc`, `~/.bashrc` or fish `config.fish`, picked from `$SHELL`):
 ```bash
 ./install.sh
 ```
 
 Or add the alias manually:
 ```bash
-echo "alias atop='$PWD/atop'" >> ~/.zshrc
+echo "alias mactop='$PWD/mactop'" >> ~/.zshrc
 . ~/.zshrc
-atop
+mactop
 ```
 
 ---
@@ -98,8 +98,8 @@ atop
 ## ⚙️ Command-Line Options
 
 ```bash
-atop -r 500            # refresh every 500 ms (alias: --refresh-ms)
-atop -t gruvbox        # start with a different theme (alias: --theme)
+mactop -r 500          # refresh every 500 ms (alias: --refresh-ms)
+mactop -t gruvbox      # start with a different theme (alias: --theme)
 ```
 
 ---
@@ -122,7 +122,7 @@ atop -t gruvbox        # start with a different theme (alias: --theme)
 
 ## 🙌 Credits
 
-Original `ptop` and `atop` by **Argo** (*Gemini 4 Argon*) in collaboration with **stavros**. Linux `shtop` port by **Claude**.
+Original `ptop` and `mactop` by **Argo** (*Gemini 4 Argon*) in collaboration with **stavros**. Linux `shtop` port by **Claude**.
 
 ## 📄 License
 
